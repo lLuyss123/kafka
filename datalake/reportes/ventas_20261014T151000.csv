@@ -1,0 +1,6 @@
+fecha,ciudad,num_pedidos,ventas_totales,ticket_promedio,clientes_unicos
+2026-10-14,Medellín,28,1769000,63179.0,22
+2026-10-14,Cali,26,1606000,61769.0,19
+2026-10-14,Cartagena,31,1551000,50032.0,27
+2026-10-14,Barranquilla,20,1440000,72000.0,19
+2026-10-14,Bogotá,24,1115000,46458.0,19

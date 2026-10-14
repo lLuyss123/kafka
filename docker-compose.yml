@@ -1,0 +1,155 @@
+# =====================================================================
+#  EL PLANO DEL PROYECTO
+#  Este archivo le dice a Docker: "crea estas cajas (contenedores),
+#  configúralas así y conéctalas entre sí".
+#
+#  Productor -> KAFKA -> Spark Streaming -> datalake (bronze, silver)
+#                                              │
+#                         AIRFLOW -> Spark Batch -> datalake (gold, reportes)
+#
+#  Todas las cajas comparten una red interna y se llaman entre sí por su
+#  NOMBRE de servicio (por ejemplo "kafka:9092"), como si fuera una dirección.
+#  Explicación completa: README.md (en esta misma carpeta).
+# =====================================================================
+
+# ---- Bloque reutilizable: configuración común de las cajas que usan Spark ----
+# (el "&spark-airflow" le pone nombre; luego "<<: *spark-airflow" lo copia)
+x-spark-airflow: &spark-airflow
+  build: ./spark                      # receta: spark/Dockerfile (Airflow + Java + PySpark)
+  image: pipeline-spark-airflow:1.0
+  user: "${AIRFLOW_UID:-50000}:0"     # corre con TU usuario (sale del archivo .env) para que los archivos sean tuyos
+  volumes:                            # "carpetas compartidas" entre tu PC y la caja:  tu_pc:dentro_de_la_caja
+    - ./datalake:/opt/datalake        #   el almacén de datos
+    - ./spark/jobs:/opt/jobs          #   el código de Spark
+  environment: &spark-env
+    PYSPARK_PYTHON: python
+    SPARK_SUBMIT_OPTS: "-Duser.home=/tmp"   # carpeta "personal" para Java (tu usuario no tiene una dentro de la caja)
+
+services:
+
+  # ================= ETAPA 1: KAFKA (la cinta transportadora) =================
+  kafka:
+    image: apache/kafka:3.8.0         # imagen oficial, se descarga de internet
+    container_name: kafka
+    ports:
+      - "9094:9094"                   # puerta hacia tu PC: desde fuera de Docker se usa localhost:9094
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx384m -Xms384m"          # máximo de memoria (tu Docker tiene poca RAM)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller        # modo KRaft: Kafka moderno, sin Zookeeper
+      # Kafka "escucha" en 3 puertas:
+      #   9092 -> para las otras cajas (se anuncia como kafka:9092)
+      #   9093 -> uso interno de Kafka (controller)
+      #   9094 -> para programas en tu PC (se anuncia como localhost:9094)
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Solo hay 1 servidor de Kafka, así que cada dato se guarda 1 vez (en una empresa serían 3 copias)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:                      # Docker pregunta cada 5 s "¿Kafka ya responde?" -> estado (healthy)
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  # Caja "de un solo uso": crea el topic "pedidos" con 3 particiones y se apaga (Exited 0 = OK).
+  kafka-init:
+    image: apache/kafka:3.8.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy    # espera a que Kafka esté listo
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic pedidos --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic pedidos
+
+  # Página web para VER Kafka por dentro: topics, particiones, mensajes, consumidores.
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    ports:
+      - "8088:8080"                   # abre http://localhost:8088
+    environment:
+      JAVA_OPTS: "-Xmx256m"           # máximo de memoria
+      KAFKA_CLUSTERS_0_NAME: pipeline-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ================= ETAPA 2: PRODUCTOR Y CONSUMIDOR (carpeta productor/) =================
+  # La "app de domicilios" falsa: inventa pedidos sin parar y los envía a Kafka.
+  productor:
+    build: ./productor                # receta: productor/Dockerfile
+    image: pipeline-productor:1.0
+    container_name: productor
+    command: ["python", "-u", "productor.py"]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092     # "dirección" de Kafka dentro de la red de Docker
+      PEDIDOS_POR_SEGUNDO: "2"        # cámbialo para simular más o menos clientes
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully   # espera a que exista el topic
+
+  # Otro "equipo" de la empresa que lee el MISMO topic, de forma independiente.
+  consumidor-alertas:
+    image: pipeline-productor:1.0     # reutiliza la misma imagen del productor
+    container_name: consumidor-alertas
+    command: ["python", "-u", "consumidor_alertas.py"]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on:
+      productor:
+        condition: service_started
+
+  # ================= ETAPA 3: SPARK STREAMING (carpeta spark/) =================
+  # Cada 10 s lee de Kafka y escribe en datalake/bronze (crudo) y datalake/silver (limpio).
+  spark-streaming:
+    <<: *spark-airflow                # copia el bloque común de arriba
+    container_name: spark-streaming
+    restart: unless-stopped           # si se cae (p. ej. sin memoria), Docker lo vuelve a encender solo
+    # Se lanza vía "bash -c": así la imagen registra tu usuario (Spark lo necesita)
+    # y no confunde el comando con uno de Airflow.
+    command: ["bash", "-c", "exec spark-submit --master local[2] --driver-memory 512m --conf spark.ui.enabled=false /opt/jobs/streaming_pedidos.py"]
+    environment:
+      <<: *spark-env
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  # ================= ETAPA 4: AIRFLOW (carpeta airflow/) =================
+  # El jefe de planta. Modo "standalone" = base de datos + programador + web en una sola caja.
+  # Usa la misma imagen que Spark porque una de sus tareas ejecuta spark-submit.
+  airflow:
+    <<: *spark-airflow
+    container_name: airflow
+    ports:
+      - "8089:8080"                   # abre http://localhost:8089  (usuario: admin / clave: admin)
+    environment:
+      <<: *spark-env
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"              # no cargar los DAGs de ejemplo
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false" # el DAG arranca activado
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "15"    # busca DAGs nuevos cada 15 s
+      AIRFLOW__WEBSERVER__WORKERS: "1"                   # 1 proceso web en vez de 4 (ahorra RAM)
+    volumes:
+      - ./datalake:/opt/datalake
+      - ./spark/jobs:/opt/jobs
+      - ./airflow/dags:/opt/airflow/dags   # aquí Airflow busca los DAGs
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create --username admin --password admin --firstname Admin \
+          --lastname Pipeline --role Admin --email admin@example.com || true
+        exec airflow standalone
